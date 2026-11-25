@@ -23,7 +23,7 @@ public sealed class DefenderNrtFeatures
         foreach (var entry in snapshot.Overrides)
         {
             if (entry.Kind is not ("operator" or "function") || string.IsNullOrWhiteSpace(entry.Name) ||
-                string.IsNullOrWhiteSpace(entry.Shape) || entry.Shape.Contains("expression", StringComparison.Ordinal) ||
+                !CanOverrideShape(entry.Shape) ||
                 entry.ArgumentTypes is null || entry.ArgumentTypes.Count == 0 || entry.ArgumentTypes.Any(t => !AzureMonitorTransformationFeatures.ScalarTypes.Contains(t)) ||
                 !overrides.TryAdd(Key(entry.Kind, entry.Name, entry.Shape, entry.ArgumentTypes), entry))
                 throw new InvalidDataException("The Defender NRT override snapshot contains an invalid or duplicate entry.");
@@ -34,7 +34,10 @@ public sealed class DefenderNrtFeatures
 
     public bool? ObservedSupport(NrtFeatureUse feature) => overrides.TryGetValue(feature.Key, out var entry) ? entry.Supported : null;
 
-    public bool Supports(NrtFeatureUse feature) => ObservedSupport(feature) ?? Documented(feature.Kind, feature.Name);
+    public static bool CanOverrideShape(string shape) => !string.IsNullOrWhiteSpace(shape) && shape != "expression-list";
+
+    public bool Supports(NrtFeatureUse feature) => ObservedSupport(feature) ??
+        (feature is { Kind: "function", Name: "not", ArgumentTypes: ["bool"] } || Documented(feature.Kind, feature.Name));
 
     public static bool Documented(string kind, string name) => kind == "function"
         ? AzureMonitorTransformationFeatures.AllowedFunctions.Contains(name)

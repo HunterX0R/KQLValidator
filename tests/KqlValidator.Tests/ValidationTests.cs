@@ -345,19 +345,28 @@ public sealed class ValidationTests
     }
 
     [Fact]
-    public void Defender_nrt_rejects_multi_input_operators_and_comments()
+    public void Defender_nrt_comments_are_advisory()
     {
-        var result = validator.Validate(new ValidateRequest(
-            "// explanation\nDeviceEvents | join kind=inner (DeviceInfo) on DeviceId | project Timestamp, DeviceId",
-            KqlEnvironment.Xdr,
-            LintProfile.Detection,
-            Target: KqlTarget.DefenderNrt), TestContext.Current.CancellationToken);
+        var result = Validate("// explanation\nDeviceEvents | project Timestamp, DeviceId, ReportId",
+            KqlEnvironment.Xdr, LintProfile.Detection, target: KqlTarget.DefenderNrt);
 
-        Assert.Contains(result.Diagnostics, x => x.RuleId == "KQLN001" && x.Severity == DiagnosticSeverity.Error);
-        Assert.Contains(result.Diagnostics, x => x.RuleId == "KQLN002" && x.Severity == DiagnosticSeverity.Error);
-        Assert.Contains(result.Diagnostics, x => x.RuleId == "KQLN001" && x.Message.Contains("scheduled detection", StringComparison.Ordinal));
-        Assert.Contains(result.Diagnostics, x => x.RuleId == "KQLN002" && x.Message.Contains("Remove the comment", StringComparison.Ordinal));
-        Assert.DoesNotContain(result.Diagnostics, x => x.RuleId == "KQLH009");
+        var diagnostic = Assert.Single(result.Diagnostics, x => x.RuleId == "KQLN002");
+        Assert.Equal(DiagnosticSeverity.Warning, diagnostic.Severity);
+        Assert.True(result.Valid, Messages(result));
+    }
+
+    [Theory]
+    [InlineData("DeviceEvents | join kind=inner (DeviceEvents) on DeviceId")]
+    [InlineData("DeviceEvents | union DeviceEvents")]
+    [InlineData("let Events = (union DeviceEvents, DeviceEvents); Events")]
+    [InlineData("let Input = externaldata(Value:string)[@'https://example.invalid/data.csv']; DeviceEvents")]
+    public void Defender_nrt_rejects_multi_input_operators(string query)
+    {
+        var result = Validate(query, KqlEnvironment.Xdr, LintProfile.Detection, target: KqlTarget.DefenderNrt);
+
+        Assert.Contains(result.Diagnostics, x => x.RuleId == "KQLN001" && x.Severity == DiagnosticSeverity.Error &&
+            x.Message.Contains("scheduled detection", StringComparison.Ordinal));
+        Assert.False(result.Valid);
     }
 
     [Fact]
@@ -376,6 +385,7 @@ public sealed class ValidationTests
             LintProfile.Detection,
             target: KqlTarget.DefenderNrt);
 
+        Assert.False(result.Valid);
         Assert.Contains(result.Diagnostics, x => x.RuleId == "KQLN001" && x.Severity == DiagnosticSeverity.Error);
         Assert.DoesNotContain(result.Diagnostics, x => x.RuleId == "KQLN004" && x.Message.Contains("'in()'", StringComparison.Ordinal));
         Assert.Contains("DeviceInfo", result.ReferencedTables);
@@ -410,8 +420,10 @@ public sealed class ValidationTests
             LintProfile.Detection,
             target: KqlTarget.DefenderNrt);
 
-        Assert.Contains(unsupportedTable.Diagnostics, x => x.RuleId == "KQLN003");
-        Assert.Contains(unsupportedColumn.Diagnostics, x => x.RuleId == "KQLN006");
+        Assert.False(unsupportedTable.Valid);
+        Assert.False(unsupportedColumn.Valid);
+        Assert.Contains(unsupportedTable.Diagnostics, x => x.RuleId == "KQLN003" && x.Severity == DiagnosticSeverity.Error);
+        Assert.Contains(unsupportedColumn.Diagnostics, x => x.RuleId == "KQLN006" && x.Severity == DiagnosticSeverity.Error);
     }
 
     [Fact]
@@ -434,8 +446,71 @@ public sealed class ValidationTests
             target: KqlTarget.DefenderNrt);
 
         Assert.DoesNotContain(validRegex.Diagnostics, x => x.RuleId is "KQLN004" or "KQLN005");
-        Assert.Contains(invalidRegex.Diagnostics, x => x.RuleId == "KQLN005");
-        Assert.Contains(unsupportedOperator.Diagnostics, x => x.RuleId == "KQLN004");
+        Assert.False(invalidRegex.Valid);
+        Assert.Contains(invalidRegex.Diagnostics, x => x.RuleId == "KQLN005" && x.Severity == DiagnosticSeverity.Error);
+        Assert.Contains(unsupportedOperator.Diagnostics, x => x.RuleId == "KQLN004" && x.Severity == DiagnosticSeverity.Warning);
+    }
+
+    [Theory]
+    [InlineData("where not(DeviceName == 'example')")]
+    [InlineData("filter DeviceName == 'example'")]
+    [InlineData("sort by Timestamp desc")]
+    [InlineData("order by Timestamp desc")]
+    public void Defender_nrt_accepts_boolean_negation_and_pipe_synonyms(string clause)
+    {
+        var result = Validate($"DeviceProcessEvents | {clause} | project Timestamp, DeviceId, ReportId",
+            KqlEnvironment.Xdr, LintProfile.Detection, target: KqlTarget.DefenderNrt);
+
+        Assert.True(result.Valid, Messages(result));
+        Assert.DoesNotContain(result.Diagnostics, x => x.RuleId == "KQLN004");
+    }
+
+    [Theory]
+    [InlineData("where", "DeviceName", "'alpha', 'beta'", "")]
+    [InlineData("where", "parse_json(AdditionalFields)", "'alpha', 'beta'", "")]
+    [InlineData("where", "DeviceName", "term, 'beta'", "let term = 'alpha';\n")]
+    [InlineData("filter", "DeviceName", "terms", "let terms = dynamic(['alpha', 'beta']);\n")]
+    public void Defender_nrt_accepts_supported_has_any_and_has_all_operands(
+        string filter, string left, string right, string declaration)
+    {
+        foreach (var operation in new[] { "has_any", "has_all" })
+        {
+            var result = Validate($"{declaration}DeviceProcessEvents | {filter} {left} {operation} ({right}) | project Timestamp, DeviceId, ReportId",
+                KqlEnvironment.Xdr, LintProfile.Detection, target: KqlTarget.DefenderNrt);
+
+            Assert.True(result.Valid, Messages(result));
+            Assert.DoesNotContain(result.Diagnostics, x => x.RuleId == "KQLN004");
+        }
+    }
+
+    [Theory]
+    [InlineData("serialize", "serialize")]
+    [InlineData("where reverse(DeviceName) == 'example'", "reverse()")]
+    [InlineData("where DeviceName in~ (strcat('exam', DeviceName))", "in~")]
+    public void Defender_nrt_warns_for_unverified_features(string clause, string feature)
+    {
+        var query = $"DeviceProcessEvents | {clause} | project Timestamp, DeviceId, ReportId";
+        var result = Validate(query, KqlEnvironment.Xdr, LintProfile.Detection, target: KqlTarget.DefenderNrt);
+        var errorsOnly = Validate(query, KqlEnvironment.Xdr, LintProfile.Detection, target: KqlTarget.DefenderNrt,
+            lint: new(MinimumSeverity: DiagnosticSeverity.Error));
+
+        var diagnostic = Assert.Single(result.Diagnostics, x => x.RuleId == "KQLN004");
+        Assert.Contains($"'{feature}'", diagnostic.Message, StringComparison.Ordinal);
+        Assert.Equal(DiagnosticSeverity.Warning, diagnostic.Severity);
+        Assert.True(result.Valid, Messages(result));
+        Assert.DoesNotContain(errorsOnly.Diagnostics, x => x.RuleId == "KQLN004");
+    }
+
+    [Fact]
+    public void Defender_nrt_rejects_tabular_user_defined_function_arguments()
+    {
+        var result = Validate("let Identity = (rows:(DeviceId:string)) { rows }; DeviceEvents | invoke Identity()",
+            KqlEnvironment.Xdr, LintProfile.Detection, target: KqlTarget.DefenderNrt,
+            lint: new(MinimumSeverity: DiagnosticSeverity.Error));
+
+        Assert.Contains(result.Diagnostics, x => x.RuleId == "KQLN004" && x.Severity == DiagnosticSeverity.Error &&
+            x.Message.Contains("scalar", StringComparison.Ordinal));
+        Assert.False(result.Valid);
     }
 
     [Fact]
@@ -1034,7 +1109,7 @@ public sealed class ValidationTests
     public void Diagnostic_truncation_preserves_blocking_nrt_errors()
     {
         var query = "DeviceProcessEvents | project " + string.Join(", ",
-            Enumerable.Range(0, 500).Select(i => $"A{i}=extract('a', 0, FileName)")) + " | summarize count()";
+            Enumerable.Range(0, 500).Select(i => $"A{i}=extract('a', 0, FileName)")) + " | where A0 hasprefix_cs 'alpha'";
         var result = Validate(query, profile: LintProfile.Detection, target: KqlTarget.DefenderNrt);
 
         Assert.False(result.Valid);
@@ -1157,8 +1232,9 @@ public sealed class ValidationTests
         KqlEnvironment environment = KqlEnvironment.Xdr,
         LintProfile profile = LintProfile.General,
         ValidationExtensions? extensions = null,
-        KqlTarget? target = null) =>
-        validator.Validate(new ValidateRequest(query, environment, profile, extensions, target));
+        KqlTarget? target = null,
+        LintOptions? lint = null) =>
+        validator.Validate(new ValidateRequest(query, environment, profile, extensions, target, lint));
 
     private static string Messages(ValidationResponse response) =>
         string.Join(Environment.NewLine, response.Diagnostics.Select(x => $"{x.RuleId}: {x.Message}"));

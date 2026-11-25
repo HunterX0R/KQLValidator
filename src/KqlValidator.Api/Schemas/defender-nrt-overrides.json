@@ -1626,6 +1626,26 @@
       "name": "has_all",
       "shape": "literal-list",
       "argumentTypes": [
+        "dynamic",
+        "string"
+      ],
+      "supported": true
+    },
+    {
+      "kind": "operator",
+      "name": "has_all",
+      "shape": "literal-list",
+      "argumentTypes": [
+        "string",
+        "string"
+      ],
+      "supported": true
+    },
+    {
+      "kind": "operator",
+      "name": "has_all",
+      "shape": "literal-variable-list",
+      "argumentTypes": [
         "string",
         "string"
       ],
@@ -1639,7 +1659,7 @@
         "string",
         "dynamic"
       ],
-      "supported": false
+      "supported": true
     },
     {
       "kind": "operator",
@@ -1660,6 +1680,16 @@
         "dynamic"
       ],
       "supported": false
+    },
+    {
+      "kind": "operator",
+      "name": "has_any",
+      "shape": "literal-list",
+      "argumentTypes": [
+        "dynamic",
+        "string"
+      ],
+      "supported": true
     },
     {
       "kind": "operator",
@@ -1689,7 +1719,7 @@
         "string",
         "dynamic"
       ],
-      "supported": false
+      "supported": true
     },
     {
       "kind": "operator",

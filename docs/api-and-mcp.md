@@ -47,6 +47,7 @@ Validate new or changed KQL and revalidate after repairs. Use [schema discovery]
 - Inspect `valid`, diagnostics with source spans, and inferred output columns. A successful tool call can return `valid: false`; warnings can remain with `valid: true`.
 - Invalid KQL returns HTTP 200 with `valid: false`. Invalid REST request shapes return HTTP 400 Problem Details.
 - Queries are limited to 65,536 characters; HTTP request bodies are limited to 256 KiB.
+- Static analysis returns HTTP 400 with `field: query` and `Query exceeds the static analysis complexity limit.` when an analysis regular expression exceeds its 250 ms match budget or wildcard projection analysis exceeds 64 query rebinds, 64 nested function expansions, or 256 distinct function bodies. These checks apply even within the query length limit.
 - Responses retain up to 500 diagnostics, prioritizing errors, and add `KQLV001` on truncation. Validity uses all diagnostics.
 - Analysis has a five-second deadline and can return HTTP 504. Production rate limits return HTTP 429 with `Retry-After: 1`; see [hosting limits](self-hosting.md#limits-and-health).
 

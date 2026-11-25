@@ -3,6 +3,7 @@ using KqlValidator.Contracts;
 using KqlValidator.NrtProbe;
 using KqlValidator.Validation;
 using Kusto.Language;
+using DiagnosticSeverity = KqlValidator.Contracts.DiagnosticSeverity;
 
 namespace KqlValidator.Tests;
 
@@ -91,14 +92,15 @@ public sealed class DefenderNrtProbeTests
     [InlineData("let term = tolower('TEST');", "term")]
     [InlineData("let term = 'test';", "term, FileName")]
     [InlineData("let term = 'test';", "term, tolower('EXAMPLE')")]
-    [InlineData("let term = dynamic(['test']);", "term")]
     [InlineData("let term = tolower('TEST');", "term, 'example'")]
-    public void Literal_variable_support_keeps_unverified_membership_operands_separate(string declaration, string operands)
+    public void Unverified_has_any_operands_warn(string declaration, string operands)
     {
         var query = $"{declaration}\nDeviceProcessEvents | where DeviceName has_any ({operands})";
         var result = Validator().Validate(new(query, KqlEnvironment.Xdr, LintProfile.Detection,
             Target: KqlTarget.DefenderNrt), TestContext.Current.CancellationToken);
-        Assert.Contains(result.Diagnostics, d => d.RuleId == "KQLN004" && d.Message.Contains("'has_any'", StringComparison.Ordinal));
+        Assert.Contains(result.Diagnostics, d => d.RuleId == "KQLN004" && d.Severity == DiagnosticSeverity.Warning &&
+            d.Message.Contains("'has_any'", StringComparison.Ordinal));
+        Assert.True(result.Valid);
     }
 
     [Fact]
@@ -152,7 +154,9 @@ public sealed class DefenderNrtProbeTests
     {
         var result = Validator().Validate(new($"DeviceProcessEvents | where {predicate}", KqlEnvironment.Xdr,
             LintProfile.Detection, Target: KqlTarget.DefenderNrt), TestContext.Current.CancellationToken);
-        Assert.Contains(result.Diagnostics, d => d.RuleId == "KQLN004" && d.Message.Contains("support catalog", StringComparison.Ordinal));
+        Assert.Contains(result.Diagnostics, d => d.RuleId == "KQLN004" && d.Severity == DiagnosticSeverity.Error &&
+            d.Message.Contains("support catalog records a rejection", StringComparison.Ordinal));
+        Assert.False(result.Valid);
         Assert.DoesNotContain(result.Diagnostics, d => d.Message.Contains("has_any()", StringComparison.Ordinal));
     }
 
@@ -192,11 +196,42 @@ public sealed class DefenderNrtProbeTests
     }
 
     [Fact]
-    public void Root_search_keeps_its_tabular_restriction()
+    public void Root_search_warns_about_compatibility()
     {
         var result = Validator().Validate(new("search in (DeviceProcessEvents) 'test'", KqlEnvironment.Xdr,
             LintProfile.Detection, Target: KqlTarget.DefenderNrt), TestContext.Current.CancellationToken);
-        Assert.Contains(result.Diagnostics, d => d.RuleId == "KQLN004" && d.Message.Contains("'search'", StringComparison.Ordinal));
+        Assert.Contains(result.Diagnostics, d => d.RuleId == "KQLN004" && d.Severity == DiagnosticSeverity.Warning &&
+            d.Message.Contains("'search'", StringComparison.Ordinal));
+        Assert.True(result.Valid);
+    }
+
+    [Theory]
+    [InlineData("expression", true)]
+    [InlineData("expression-list", false)]
+    public void Operand_overrides_accept_scoped_expressions(string shape, bool overridable)
+    {
+        var fixture = ProbeInventory.PrepareFollowUp().Fixtures.Single(f => f.Id == "follow-up-has-any-udf-parameter");
+        var use = fixture.Feature! with { Shape = shape };
+        var baseline = new NrtFeatureSnapshot(1, DefenderNrtFeatures.Endpoint, []);
+        var finding = new ProbeFinding(use, false, "supported", 4, 2, true, [], [fixture.Id]);
+        var merged = ProbeReport.Merge(baseline, [finding]);
+        if (!overridable)
+        {
+            Assert.Empty(merged.Overrides);
+            Assert.Throws<InvalidDataException>(() => WithSnapshot(baseline with
+            {
+                Overrides = [new(use.Kind, use.Name, use.Shape, use.ArgumentTypes, true)],
+            }, _ => { }));
+            return;
+        }
+
+        WithSnapshot(merged, catalog =>
+        {
+            var result = Validator(catalog).Validate(new(fixture.Query, KqlEnvironment.Xdr, LintProfile.Detection,
+                Target: KqlTarget.DefenderNrt), TestContext.Current.CancellationToken);
+            Assert.True(result.Valid);
+            Assert.DoesNotContain(result.Diagnostics, d => d.RuleId == "KQLN004");
+        });
     }
 
     [Fact]
@@ -347,7 +382,7 @@ public sealed class DefenderNrtProbeTests
         var snapshot = JsonSerializer.Deserialize<NrtFeatureSnapshot>(File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Schemas", "defender-nrt-overrides.json")), DefenderNrtFeatures.JsonOptions)!;
         var shipped = snapshot.Overrides.ToDictionary(e => DefenderNrtFeatures.Key(e.Kind, e.Name, e.Shape, e.ArgumentTypes));
         var groups = Inventory.Value.Fixtures.Where(f => f.Feature is not null).GroupBy(f => f.Feature!.Key).ToArray();
-        Assert.Equal(207, shipped.Count);
+        Assert.Equal(210, shipped.Count);
         Assert.Equal(205, groups.Length);
         Assert.All(groups, group => Assert.True(shipped.ContainsKey(group.Key), group.Key));
         var json = JsonSerializer.SerializeToElement(snapshot, DefenderNrtFeatures.JsonOptions);

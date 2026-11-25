@@ -2,6 +2,8 @@ using System.Text.RegularExpressions;
 using KqlValidator.Contracts;
 using Kusto.Language;
 using Kusto.Language.Syntax;
+using DiagnosticSeverity = KqlValidator.Contracts.DiagnosticSeverity;
+using FunctionDeclaration = Kusto.Language.Syntax.FunctionDeclaration;
 
 namespace KqlValidator.Validation;
 
@@ -29,14 +31,14 @@ public sealed class DefenderNrtValidator
         "SecurityEvent", "SigninLogs",
     };
 
-    private static readonly IReadOnlySet<string> AllowedTabularOperators = AzureMonitorTransformationFeatures.AllowedPipeOperators;
-
-    private static readonly IReadOnlySet<string> ScalarTypes = AzureMonitorTransformationFeatures.ScalarTypes;
+    private static readonly IReadOnlySet<string> AllowedTabularOperators = new HashSet<string>(
+        AzureMonitorTransformationFeatures.AllowedPipeOperators, StringComparer.OrdinalIgnoreCase)
+    {
+        "filter", "sort", "order",
+    };
 
     private static readonly Regex Comment = new(@"(?m)//[^\r\n]*|/\*[\s\S]*?\*/", RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex StringLiteral = new("""@?(?:"(?:""|\\.|[^"])*"|'(?:''|\\.|[^'])*')""", RegexOptions.CultureInvariant, RegexTimeout);
-    private static readonly Regex MultiInput = new(@"(?im)(?:^|[;|])\s*(?:join\b|union\b)|\bexternaldata\s*\(", RegexOptions.CultureInvariant, RegexTimeout);
-    private static readonly Regex LocalFunction = new(@"(?im)(?:^|;)\s*let\s+(?<name>[A-Za-z_]\w*)\s*=\s*\((?<parameters>[^)]*)\)\s*\{", RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex RegexRhs = new("""(?is)\bmatches\s+regex\s+(?<value>@?(?:"(?:""|\\.|[^"])*"|'(?:''|\\.|[^'])*')|[A-Za-z_]\w*|[^\s|;]+)""", RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex Alias = new(@"(?im)\|\s*(?:extend|project)\s+(?<alias>[A-Za-z_]\w*)\s*=\s*(?<source>Timestamp|TimeGenerated)\b", RegexOptions.CultureInvariant, RegexTimeout);
     private static readonly Regex WhereClause = new(@"(?im)\|\s*where\b(?<predicate>[^|;]*)", RegexOptions.CultureInvariant, RegexTimeout);
@@ -75,7 +77,7 @@ public sealed class DefenderNrtValidator
         }
 
         AddTableDiagnostics(diagnostics, policy, query, referencedTables, referencedColumns, request.Environment);
-        AddStructuralDiagnostics(diagnostics, policy, query, searchable, cancellationToken);
+        AddCommentDiagnostics(diagnostics, policy, query, cancellationToken);
         AddFeatureDiagnostics(diagnostics, policy, query, code, cancellationToken);
         AddRegexDiagnostics(diagnostics, policy, query, code, cancellationToken);
         AddTimeFilterDiagnostics(diagnostics, policy, query, searchable, cancellationToken);
@@ -119,58 +121,57 @@ public sealed class DefenderNrtValidator
         }
     }
 
-    private void AddStructuralDiagnostics(List<ValidationDiagnostic> diagnostics, LintPolicy policy, string query, string searchable, CancellationToken cancellationToken)
+    private void AddCommentDiagnostics(List<ValidationDiagnostic> diagnostics, LintPolicy policy, string query, CancellationToken cancellationToken)
     {
-        foreach (Match match in MultiInput.Matches(searchable))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            Add(diagnostics, policy, query, "KQLN001",
-                "Defender continuous NRT rules do not support join, union, or externaldata. Rewrite this as a single-input query or use a scheduled detection.", match.Index, match.Length);
-        }
-
         foreach (Match match in Comment.Matches(MaskStringLiterals(query)))
         {
             cancellationToken.ThrowIfCancellationRequested();
             Add(diagnostics, policy, query, "KQLN002",
-                "Defender continuous NRT rules do not support comments in deployed KQL. Remove the comment or use a scheduled target if comments must remain.", match.Index, match.Length);
+                "Defender documents a comment-free format for continuous NRT queries. Verify compatibility before publishing this query.", match.Index, match.Length);
         }
     }
 
     private void AddFeatureDiagnostics(List<ValidationDiagnostic> diagnostics, LintPolicy policy, string query, KustoCode code, CancellationToken cancellationToken)
     {
-        var localFunctions = CollectLocalScalarFunctions(diagnostics, policy, query, cancellationToken);
         SyntaxElement.WalkNodes(code.Syntax, node =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (node is QueryOperator operation && operation.GetChild(0) is SyntaxToken token && !AllowedTabularOperators.Contains(token.Text))
-                Add(diagnostics, policy, query, "KQLN004",
-                    $"'{token.Text}' is outside the Defender NRT tabular operator catalog. Use a supported operator or a scheduled detection.", token.TextStart, token.Width);
+            switch (node)
+            {
+                case JoinOperator or UnionOperator or ExternalDataExpression:
+                    var keyword = node.GetFirstToken();
+                    Add(diagnostics, policy, query, "KQLN001",
+                        "Defender continuous NRT rules do not support join, union, or externaldata. Rewrite this as a single-input query or use a scheduled detection.",
+                        keyword.TextStart, keyword.Width);
+                    return;
+                case FunctionDeclaration declaration when declaration.Parameters.Parameters.Any(
+                    parameter => parameter.Element.NameAndType.Type is SchemaTypeExpression):
+                    Add(diagnostics, policy, query, "KQLN004",
+                        "Defender continuous NRT rules require scalar arguments for user-defined functions.",
+                        declaration.Parameters.TextStart, declaration.Parameters.Width, DiagnosticSeverity.Error);
+                    return;
+                case QueryOperator operation when operation.GetChild(0) is SyntaxToken token && !AllowedTabularOperators.Contains(token.Text):
+                    Add(diagnostics, policy, query, "KQLN004",
+                        $"The Defender NRT catalog has no entry for '{token.Text}'. Check this query with the compatibility endpoint.",
+                        token.TextStart, token.Width);
+                    return;
+                case FunctionCallExpression { ReferencedSignature.Declaration: not null }:
+                    // The declaration's parameter types are checked separately.
+                    return;
+            }
+
             var feature = DefenderNrtFeatures.GetUse(node);
-            if (feature is null || feature.Kind == "function" && localFunctions.Contains(feature.Name) || features.Supports(feature))
+            if (feature is null || features.Supports(feature))
                 return;
             var display = feature.Kind == "function" ? $"{feature.Name}()" : feature.Name;
-            Add(diagnostics, policy, query, "KQLN004",
-                $"'{display}' with {feature.Shape} operands ({string.Join(", ", feature.ArgumentTypes)}) is outside the Defender NRT support catalog. Check this query with the compatibility endpoint or use a scheduled detection.",
-                feature.Start, feature.Length);
+            var form = feature.ArgumentTypes.Count == 0 ? $"'{display}'" :
+                $"'{display}' with {feature.Shape} operands ({string.Join(", ", feature.ArgumentTypes)})";
+            var rejected = features.ObservedSupport(feature) == false;
+            Add(diagnostics, policy, query, "KQLN004", rejected
+                ? $"The Defender NRT support catalog records a rejection for {form}. Use a supported form or a scheduled detection."
+                : $"{form} is outside the Defender NRT support catalog. Check this query with the compatibility endpoint.",
+                feature.Start, feature.Length, rejected ? DiagnosticSeverity.Error : null);
         });
-    }
-
-    private HashSet<string> CollectLocalScalarFunctions(List<ValidationDiagnostic> diagnostics, LintPolicy policy, string query, CancellationToken cancellationToken)
-    {
-        var functions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Match match in LocalFunction.Matches(MaskCommentsAndStrings(query)))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var parameters = match.Groups["parameters"].Value;
-            var scalar = parameters.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-                .All(parameter => parameter.Split(':', 2) is [_, var type] && ScalarTypes.Contains(type.Trim()));
-            if (scalar)
-                functions.Add(match.Groups["name"].Value);
-            else
-                Add(diagnostics, policy, query, "KQLN004",
-                    "Defender continuous NRT rules support user-defined functions only when every argument is scalar.", match.Index, match.Length);
-        }
-        return functions;
     }
 
     private void AddRegexDiagnostics(List<ValidationDiagnostic> diagnostics, LintPolicy policy, string query, KustoCode code, CancellationToken cancellationToken)
@@ -217,9 +218,10 @@ public sealed class DefenderNrtValidator
         }
     }
 
-    private void Add(List<ValidationDiagnostic> diagnostics, LintPolicy policy, string query, string ruleId, string message, int start, int length = 1)
+    private void Add(List<ValidationDiagnostic> diagnostics, LintPolicy policy, string query, string ruleId, string message,
+        int start, int length = 1, DiagnosticSeverity? severity = null)
     {
-        var diagnostic = rules.CreateDiagnostic(query, ruleId, message, start, Math.Max(1, length));
+        var diagnostic = rules.CreateDiagnostic(query, ruleId, message, start, Math.Max(1, length), severity);
         if (policy.IsEnabled(ruleId, diagnostic.Severity))
             diagnostics.Add(diagnostic);
     }

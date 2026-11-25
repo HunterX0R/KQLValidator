@@ -75,7 +75,7 @@ public static class ProbeReport
     public static NrtFeatureSnapshot Merge(NrtFeatureSnapshot baseline, IReadOnlyList<ProbeFinding> findings)
     {
         var entries = baseline.Overrides.ToDictionary(e => DefenderNrtFeatures.Key(e.Kind, e.Name, e.Shape, e.ArgumentTypes));
-        foreach (var finding in findings.Where(f => f.StreamingSupported.HasValue && !f.Feature.Shape.Contains("expression", StringComparison.Ordinal)))
+        foreach (var finding in findings.Where(f => f.StreamingSupported.HasValue && DefenderNrtFeatures.CanOverrideShape(f.Feature.Shape)))
         {
             var feature = finding.Feature;
             entries[feature.Key] = new(feature.Kind, feature.Name, feature.Shape, feature.ArgumentTypes,
